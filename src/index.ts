@@ -1,13 +1,8 @@
-// V66k + KV(目录前缀自适配): 在原 V66k 基础上增加 Workers KV 源码读取、可选上传接口，
-// 并新增“多前缀/多文件名回退策略”和 KV 列表诊断，便于在“带目录打包”的情况下自动命中正确的 index.php。
-//
-// 关键点：
-// - 运行链路不变：auto-run(noInitialRun=false) + argv("-r", base64 eval) + register_shutdown_function("\n")，确保输出 flush。
-// - 首页 / /public/index.php 默认从 KV 读取，失败再回退 GitHub Raw（容灾保留）。
-// - 新增 /__ls?prefix=&limit=&cursor= 用于列出 KV 键，现场确认打包前缀。
-// - 路由支持 URL 指定前缀 ?kp= 或 ?prefix=，以及 ENV.KV_PREFIX；并内置 ["", "public/", "site/", "dist/", "app/", "www/", "out/", "build/"] 回退顺序。
-// - 多文件名尝试：["public/index.php", "index.php"]，再与若干前缀组合，逐个尝试 get()，命中即执行。
-// - 保留 /__kv 诊断、/__put 受保护上传、/__probe、/run、/info、/version、/help。
+// V66k + KV(目录前缀自适配) + 运行时内存自救：
+// - 保留原有 KV 读取与多前缀/多文件名回退、/__kv/__/ls/__/put 诊断与上传。
+// - 工厂初始化更稳，去掉误导性的 "WORKER" 回退形态。
+// - 新增运行时内存调节：?mem=256(MB) 或 ?memBytes=268435456，?allowmg=1。
+//   遇到 “memory access out of bounds/oom/Cannot enlarge memory arrays” 自动放大 INITIAL_MEMORY 再试。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -80,6 +75,28 @@ function buildArgvForCode(code: string, iniList: string[] = []): string[] {
   return argv;
 }
 
+// 从 URL/ENV 读取运行时内存参数
+function readRuntimeMemoryToggles(url?: URL, env?: any): { memBytes?: number; allowMG?: boolean } {
+  let memBytes: number | undefined;
+  let allowMG = false;
+
+  if (url) {
+    const memMB = Number(url.searchParams.get("mem") || "0");
+    const memB = Number(url.searchParams.get("memBytes") || "0");
+    if (Number.isFinite(memMB) && memMB > 0) memBytes = Math.floor(memMB * 1024 * 1024);
+    if (!memBytes && Number.isFinite(memB) && memB > 0) memBytes = Math.floor(memB);
+    const amg = url.searchParams.get("allowmg");
+    if (amg === "1" || amg === "true") allowMG = true;
+  }
+  if (!memBytes && env?.INITIAL_MEMORY_BYTES && Number(env.INITIAL_MEMORY_BYTES) > 0) {
+    memBytes = Number(env.INITIAL_MEMORY_BYTES);
+  }
+  if (!allowMG && (env?.ALLOW_MEMORY_GROWTH === "1" || env?.ALLOW_MEMORY_GROWTH === "true")) {
+    allowMG = true;
+  }
+  return { memBytes, allowMG };
+}
+
 async function buildInitOptions(base: Partial<any>) {
   const opts: any = {
     noInitialRun: false, // auto-run
@@ -93,6 +110,7 @@ async function buildInitOptions(base: Partial<any>) {
     ...base,
   };
 
+  // 强制提供 wasmBinary，避免 locateFile/URL 环节的差异
   if (isWasmModule(wasmAsset)) {
     opts.instantiateWasm = makeInstantiateWithModule(wasmAsset as WebAssembly.Module);
     return opts;
@@ -116,12 +134,32 @@ async function buildInitOptions(base: Partial<any>) {
   throw new Error("Unsupported wasm asset type at runtime");
 }
 
-// Auto-run runner. Arguments MUST NOT contain a fake program name.
-async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
+// 判断是否为“内存相关”错误
+function isMemoryError(e: any): boolean {
+  const m = String(e?.message || e || "").toLowerCase();
+  return m.includes("out of memory")
+      || m.includes("memory access out of bounds")
+      || m.includes("cannot enlarge memory arrays")
+      || m.includes("abort(\"oom") || m.includes("abort('oom")
+      || m.includes("oom");
+}
+
+// 单次初始化尝试
+async function initOnce(initFactory: Function, moduleOptions: any, debug: string[]): Promise<void> {
+  debug.push("auto:init-factory");
+  await initFactory(moduleOptions);
+  // Emscripten 会在 runtime ready 时调用 onRuntimeInitialized
+}
+
+// Auto-run with retries on memory error
+async function runAuto(argv: string[], waitMs = 8000, toggles?: { memBytes?: number; allowMG?: boolean; retryBoost?: number[] }): Promise<RunResult> {
   const debug: string[] = [];
   const stdout: string[] = [];
   const stderr: string[] = [];
   let exitStatus: number | undefined;
+
+  const retryBoost = toggles?.retryBoost && toggles.retryBoost.length ? toggles.retryBoost : [256, 512]; // MB
+
   try {
     debug.push("auto:import-glue");
     const phpModule = await import("../scripts/php_8_4.js");
@@ -129,22 +167,63 @@ async function runAuto(argv: string[], waitMs = 8000): Promise<RunResult> {
     if (typeof initCandidate !== "function") {
       return { ok: false, stdout, stderr, debug, error: "PHP init factory not found" };
     }
-    debug.push("auto:build-options");
-    const moduleOptions: any = await buildInitOptions({ arguments: argv.slice() });
-    moduleOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
-    moduleOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
-    moduleOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
 
-    debug.push("auto:init-factory");
-    try { await (initCandidate as any)(moduleOptions); } catch (e1: any) {
-      try { await (initCandidate as any)("WORKER", moduleOptions); debug.push("auto:factory:WORKER:ok"); } catch (e2: any) {
-        return { ok: false, stdout, stderr, debug, error: "autoRun factory failed: " + (e1?.message || e1) + " / " + (e2?.message || e2) };
+    // 构造基础 options
+    debug.push("auto:build-options");
+    const baseOptions: any = await buildInitOptions({ arguments: argv.slice() });
+    baseOptions.print = (txt: string) => { try { stdout.push(String(txt)); } catch {} };
+    baseOptions.printErr = (txt: string) => { try { stderr.push(String(txt)); } catch {} };
+    baseOptions.onRuntimeInitialized = () => { debug.push("auto:event:onRuntimeInitialized"); };
+
+    // 应用第一次内存配置
+    if (toggles?.memBytes && Number.isFinite(toggles.memBytes)) {
+      baseOptions.INITIAL_MEMORY = Math.floor(toggles.memBytes);
+      baseOptions.initialMemory = Math.floor(toggles.memBytes); // 兼容字段
+    }
+    if (toggles?.allowMG) {
+      baseOptions.ALLOW_MEMORY_GROWTH = 1;
+    }
+
+    // 第一次尝试
+    try {
+      await initOnce(initCandidate, baseOptions, debug);
+    } catch (e1: any) {
+      if (!isMemoryError(e1)) {
+        return { ok: false, stdout, stderr, debug, error: String(e1?.message || e1) };
+      }
+      // 内存相关，按更大的 INITIAL_MEMORY 逐级重试
+      for (const mb of retryBoost) {
+        try {
+          const opt2: any = await buildInitOptions({ arguments: argv.slice() });
+          opt2.print = baseOptions.print;
+          opt2.printErr = baseOptions.printErr;
+          opt2.onRuntimeInitialized = baseOptions.onRuntimeInitialized;
+          opt2.wasmBinary = baseOptions.wasmBinary; // 复用二进制
+          opt2.INITIAL_MEMORY = mb * 1024 * 1024;
+          opt2.initialMemory = opt2.INITIAL_MEMORY;
+          if (toggles?.allowMG) opt2.ALLOW_MEMORY_GROWTH = 1;
+          debug.push(`auto:retry:mem=${mb}MB`);
+          await initOnce(initCandidate, opt2, debug);
+          // 成功则跳出重试
+          break;
+        } catch (e2: any) {
+          if (isMemoryError(e2)) {
+            // 继续下一档
+            if (mb === retryBoost[retryBoost.length - 1]) {
+              // 最后一档仍失败
+              return { ok: false, stdout, stderr, debug, error: `memory error after retries: ${e2?.message || e2}` };
+            }
+          } else {
+            return { ok: false, stdout, stderr, debug, error: e2?.message || String(e2) };
+          }
+        }
       }
     }
 
+    // 等待输出或退出
     const start = Date.now();
     while (Date.now() - start < waitMs) {
-      if (typeof moduleOptions.__exitStatus === "number") { exitStatus = moduleOptions.__exitStatus; debug.push("auto:exit:" + String(exitStatus)); break; }
+      if (typeof (baseOptions as any).__exitStatus === "number") { exitStatus = (baseOptions as any).__exitStatus; debug.push("auto:exit:" + String(exitStatus)); break; }
       if (stdout.length > 0) break;
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -169,13 +248,10 @@ function filterKnownNoise(lines: string[], keepAll: boolean) {
   });
   return { kept, ignored };
 }
-
 function inferContentTypeFromOutput(stdout: string, fallback = "text/plain; charset=utf-8") {
   if (stdout.includes("<html") || stdout.includes("<!DOCTYPE html")) return "text/html; charset=utf-8";
   return fallback;
 }
-
-// Unified finalizer with diagnostics when both stdout/stderr are empty
 function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   const debugMode = url.searchParams.get("debug") === "1" || url.searchParams.get("showstderr") === "1";
   const stdout = res.stdout.join("\n");
@@ -203,7 +279,6 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
     body = hint;
     status = 200;
   }
-
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
@@ -230,18 +305,15 @@ async function fetchKVPhpSource(env: any, key: string): Promise<{ ok: boolean; c
   }
 }
 
-// 多前缀/多文件名回退：返回首个命中的代码与命中的 key 以及尝试路径
 async function fetchKVPhpSourceWithPrefixes(env: any, url: URL, baseKey = "public/index.php"): Promise<{ ok: boolean; key?: string; code?: string; tried: string[]; err?: string }> {
   const tried: string[] = [];
   if (!env || !env.SRC || typeof env.SRC.get !== "function") {
     return { ok: false, tried, err: "KV binding SRC is not configured" };
   }
 
-  // 用户/环境指定前缀
   const qpPrefix = (url.searchParams.get("kp") || url.searchParams.get("prefix") || "").trim();
   const envPrefix = (env.KV_PREFIX || "").trim();
 
-  // 规范化：照顾是否带末尾斜杠
   function normPrefix(p: string): string {
     if (!p) return "";
     return p.endsWith("/") ? p : p + "/";
@@ -253,29 +325,24 @@ async function fetchKVPhpSourceWithPrefixes(env: any, url: URL, baseKey = "publi
     "", "public/", "site/", "dist/", "app/", "www/", "out/", "build/",
   ].filter((s) => typeof s === "string")));
 
-  // 多文件名尝试（仅默认首页时生效）
   const fileNames = Array.from(new Set([
     baseKey,
     "public/index.php",
     "index.php",
   ]));
 
-  // 若 URL 明确给了 ?key= 则仅按该 key（再叠加可能的前缀）尝试
   const keyOverride = (url.searchParams.get("key") || "").trim();
   const finalNames = keyOverride ? [keyOverride] : fileNames;
 
-  // 组合前缀与文件名
   const keysToTry: string[] = [];
   for (const pf of candidatesPrefixes) {
     for (const fn of finalNames) {
-      // pf 可能已包含相对目录；统一按“pf + fn（若 fn 本身以 / 开头，去掉）”
       const cleanFn = fn.replace(/^\/+/, "");
       const candidate = pf ? (pf + cleanFn) : cleanFn;
       if (!keysToTry.includes(candidate)) keysToTry.push(candidate);
     }
   }
 
-  // 顺序尝试
   for (const key of keysToTry) {
     tried.push(key);
     try {
@@ -283,9 +350,7 @@ async function fetchKVPhpSourceWithPrefixes(env: any, url: URL, baseKey = "publi
       if (txt != null) {
         return { ok: true, key, code: normalizePhpCodeForEval(txt), tried };
       }
-    } catch (e: any) {
-      // 读取失败继续尝试
-    }
+    } catch {}
   }
 
   return { ok: false, tried, err: "KV object not found for any candidate keys" };
@@ -331,10 +396,11 @@ function toBase64Utf8(s: string): string {
 }
 
 // ——— Routes ———
-async function routeInfo(url: URL): Promise<Response> {
+async function routeInfo(url: URL, env?: any): Promise<Response> {
   try {
     const argv = buildArgvForCode("phpinfo();");
-    const res = await runAuto(argv);
+    const toggles = readRuntimeMemoryToggles(url, env);
+    const res = await runAuto(argv, 10000, { ...toggles });
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -349,14 +415,15 @@ function wrapCodeWithShutdownNewline(code: string): string {
   return `register_shutdown_function(function(){echo "\\n";}); ${code}`;
 }
 
-async function routeRunGET(url: URL): Promise<Response> {
+async function routeRunGET(url: URL, env?: any): Promise<Response> {
   try {
     const codeRaw = url.searchParams.get("code") ?? "";
     if (!codeRaw) return textResponse("Bad Request: missing code", 400);
     if (codeRaw.length > 64 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(wrapCodeWithShutdownNewline(codeRaw), ini);
-    const res = await runAuto(argv);
+    const toggles = readRuntimeMemoryToggles(url, env);
+    const res = await runAuto(argv, 10000, { ...toggles });
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -367,14 +434,15 @@ async function routeRunGET(url: URL): Promise<Response> {
   }
 }
 
-async function routeRunPOST(request: Request, url: URL): Promise<Response> {
+async function routeRunPOST(request: Request, url: URL, env?: any): Promise<Response> {
   try {
     const code = await request.text();
     if (!code) return textResponse("Bad Request: empty body", 400);
     if (code.length > 256 * 1024) return textResponse("Payload Too Large", 413);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(wrapCodeWithShutdownNewline(code), ini);
-    const res = await runAuto(argv, 10000);
+    const toggles = readRuntimeMemoryToggles(url, env);
+    const res = await runAuto(argv, 12000, { ...toggles });
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
       return textResponse(body, 500);
@@ -419,10 +487,8 @@ async function routeKvDiag(url: URL, env: any): Promise<Response> {
 }
 
 function badKey(key: string) {
-  // 简单校验，避免非法 key
   return key.length > 512 || key.includes("..") || key.startsWith("/") || key === "";
 }
-
 async function routeKvPut(request: Request, url: URL, env: any): Promise<Response> {
   try {
     if (!env?.SRC || typeof env.SRC.put !== "function") return textResponse("KV not configured", 500);
@@ -449,7 +515,6 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
     const mode = url.searchParams.get("mode") || "";
     const baseKey = url.searchParams.get("key") || "public/index.php";
 
-    // 1) 优先从 KV 读（带多前缀/多文件名回退）
     let codeNormalized: string | undefined;
     let hitKey: string | undefined;
     if (env && env.SRC) {
@@ -460,7 +525,6 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       }
     }
 
-    // 2) KV 没拿到则回退 GitHub（容灾）
     if (!codeNormalized) {
       const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", baseKey, ref);
       if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
@@ -474,30 +538,30 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
       }
     }
 
-    // 执行：base64-eval + shutdown newline 强制 flush
     const b64 = toBase64Utf8(codeNormalized || "");
     const oneLiner = wrapCodeWithShutdownNewline(`eval(base64_decode('${b64}'));`);
     const ini = parseIniParams(url);
     const argv = buildArgvForCode(oneLiner, ini);
-    const res = await runAuto(argv, 10000);
+    const toggles = readRuntimeMemoryToggles(url, env);
+    const res = await runAuto(argv, 12000, { ...toggles });
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-      return textResponse(body, 500, hitKey ? { "x-kv-key": hitKey } : {});
+      const extra = hitKey ? { "x-kv-key": hitKey } : {};
+      return textResponse(body, 500, extra);
     }
-    const headers: Record<string, string> = { "x-source": codeNormalized ? (hitKey ? "kv" : "github") : "unknown" };
-    if (hitKey) headers["x-kv-key"] = hitKey;
     return finalizeOk(url, res, "text/html; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
   }
 }
 
-async function routeVersion(): Promise<Response> {
+async function routeVersion(url?: URL, env?: any): Promise<Response> {
   try {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-v");
-    const res = await runAuto(argv);
+    const toggles = readRuntimeMemoryToggles(url, env);
+    const res = await runAuto(argv, 8000, { ...toggles });
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -505,12 +569,13 @@ async function routeVersion(): Promise<Response> {
   }
 }
 
-async function routeHelp(): Promise<Response> {
+async function routeHelp(url?: URL, env?: any): Promise<Response> {
   try {
     const argv: string[] = [];
     for (const d of DEFAULT_INIS) { argv.push("-d", d); }
     argv.push("-h");
-    const res = await runAuto(argv);
+    const toggles = url ? readRuntimeMemoryToggles(url, env) : {};
+    const res = await runAuto(argv, 8000, { ...(toggles as any) });
     const body = (res.stdout.join("\n") || res.stderr.join("\n") || "") + (res.debug.length ? `\ntrace:${res.debug.join("->")}` : "");
     return textResponse(body || "", res.ok ? 200 : 500);
   } catch (e: any) {
@@ -568,20 +633,18 @@ export default {
         return routeKvPut(request, url, env);
       }
 
-      // Home: render KV's /public/index.php (fallback GitHub)
       if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
         return routeRepoIndex(url, env);
       }
 
-      if (pathname === "/info") return routeInfo(url);
-      if (pathname === "/run" && request.method === "GET") return routeRunGET(url);
-      if (pathname === "/run" && request.method === "POST") return routeRunPOST(request, url);
-      if (pathname === "/version") return routeVersion();
-      if (pathname === "/help") return routeHelp();
+      if (pathname === "/info") return routeInfo(url, env);
+      if (pathname === "/run" && request.method === "GET") return routeRunGET(url, env);
+      if (pathname === "/run" && request.method === "POST") return routeRunPOST(request, url, env);
+      if (pathname === "/version") return routeVersion(url, env);
+      if (pathname === "/help") return routeHelp(url, env);
 
       return textResponse("Not Found", 404);
     } catch (e: any) {
-      // Final guard against 1101
       return textResponse("Top-level handler error: " + (e?.stack || String(e)), 500);
     }
   },
