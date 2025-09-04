@@ -45,6 +45,7 @@ function requireAdmin(req: Request, env: Env): Response | null {
 // ---------- MIME ----------
 function guessContentType(pathname: string): string {
   const p = pathname.toLowerCase();
+  if (p.endsWith(".php")) return "text/plain; charset=utf-8"; // 展示源码，避免下载
   if (p.endsWith(".js")) return "application/javascript; charset=utf-8";
   if (p.endsWith(".css")) return "text/css; charset=utf-8";
   if (p.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
@@ -350,7 +351,18 @@ async function routeStaticGet(request: Request, env: Env): Promise<Response> {
       "cache-control": "public, max-age=86400, stale-while-revalidate=1800",
       "x-kv-key": key,
       "x-source": "kv",
+      "x-content-type-from": "guess",
+      "x-ctor": "files-static",
+      "x-nosniff": "1",
     });
+    // 文本类与 .php 强制 inline 展示，避免浏览器下载
+    if (ct.startsWith("text/") || key.toLowerCase().endsWith(".php") || ct.includes("javascript")) {
+      const fileName = key.split("/").pop() || "file";
+      h.set("content-disposition", `inline; filename="${encodeURIComponent(fileName)}"`);
+      h.set("x-inline", "1");
+      h.set("x-content-type-options", "nosniff");
+    }
+
     if (request.method === "HEAD") {
       return new Response(null, { status: 200, headers: h });
     }
