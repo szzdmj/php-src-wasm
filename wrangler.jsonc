@@ -1,5 +1,5 @@
 {
-  "name": "wasmphp",
+  "name": "php-src-wasm",
   "main": "src/index.ts",
   "compatibility_date": "2025-08-23",
 
