@@ -1,0 +1,18 @@
+{
+  "name": "wasmphp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-08-23",
+
+  // 可选：缩小体积/便于观察
+  "minify": true,
+  "tsconfig": "tsconfig.json",
+  "observability": { "enabled": true },
+
+  // 绑定 Workers KV（将 id 替换成你实际的 Namespace ID）
+  "kv_namespaces": [
+    {
+      "binding": "SRC",           // 代码中通过 env.SRC 使用
+      "id": "afdb066fcc2146c0bab30d8ca805a7fc"
+    }
+  ]
+}
