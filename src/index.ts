@@ -1,4 +1,14 @@
-// V66k + R2: 在 V66k 基础上增加 R2 源码读取（默认 key=public/index.php）
+// V66k + KV(目录前缀自适配): 在原 V66k 基础上增加 Workers KV 源码读取、可选上传接口，
+// 并新增“多前缀/多文件名回退策略”和 KV 列表诊断，便于在“带目录打包”的情况下自动命中正确的 index.php。
+//
+// 关键点：
+// - 运行链路不变：auto-run(noInitialRun=false) + argv("-r", base64 eval) + register_shutdown_function("\n")，确保输出 flush。
+// - 首页 / /public/index.php 默认从 KV 读取，失败再回退 GitHub Raw（容灾保留）。
+// - 新增 /__ls?prefix=&limit=&cursor= 用于列出 KV 键，现场确认打包前缀。
+// - 路由支持 URL 指定前缀 ?kp= 或 ?prefix=，以及 ENV.KV_PREFIX；并内置 ["", "public/", "site/", "dist/", "app/", "www/", "out/", "build/"] 回退顺序。
+// - 多文件名尝试：["public/index.php", "index.php"]，再与若干前缀组合，逐个尝试 get()，命中即执行。
+// - 保留 /__kv 诊断、/__put 受保护上传、/__probe、/run、/info、/version、/help。
+
 import wasmAsset from "../scripts/php_8_4.wasm";
 
 // Minimal globals for Emscripten glue in Workers
@@ -40,7 +50,6 @@ type RunResult = {
 function isWasmModule(x: any): x is WebAssembly.Module {
   return Object.prototype.toString.call(x) === "[object WebAssembly.Module]";
 }
-
 function makeInstantiateWithModule(wasmModule: WebAssembly.Module) {
   return (imports: WebAssembly.Imports, successCallback: (i: WebAssembly.Instance) => void) => {
     const instance = new WebAssembly.Instance(wasmModule, imports);
@@ -198,7 +207,7 @@ function finalizeOk(url: URL, res: RunResult, defaultCT: string) {
   return new Response(body, { status, headers: { "content-type": ct } });
 }
 
-// —— Sources: R2 first, then GitHub fallback ——
+// —— Sources: KV first (with prefixes), then GitHub fallback ——
 function normalizePhpCodeForEval(src: string): string {
   let s = src.trimStart();
   if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
@@ -208,18 +217,78 @@ function normalizePhpCodeForEval(src: string): string {
   return s;
 }
 
-async function fetchR2PhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
+async function fetchKVPhpSource(env: any, key: string): Promise<{ ok: boolean; code?: string; err?: string }> {
   try {
     if (!env || !env.SRC || typeof env.SRC.get !== "function") {
-      return { ok: false, err: "R2 binding SRC is not configured" };
+      return { ok: false, err: "KV binding SRC is not configured" };
     }
-    const obj = await env.SRC.get(key);
-    if (!obj) return { ok: false, err: `R2 object not found: ${key}` };
-    const txt = await obj.text();
+    const txt = await env.SRC.get(key, "text");
+    if (txt == null) return { ok: false, err: `KV object not found: ${key}` };
     return { ok: true, code: normalizePhpCodeForEval(txt) };
   } catch (e: any) {
-    return { ok: false, err: "R2 get failed: " + (e?.message || String(e)) };
+    return { ok: false, err: "KV get failed: " + (e?.message || String(e)) };
   }
+}
+
+// 多前缀/多文件名回退：返回首个命中的代码与命中的 key 以及尝试路径
+async function fetchKVPhpSourceWithPrefixes(env: any, url: URL, baseKey = "public/index.php"): Promise<{ ok: boolean; key?: string; code?: string; tried: string[]; err?: string }> {
+  const tried: string[] = [];
+  if (!env || !env.SRC || typeof env.SRC.get !== "function") {
+    return { ok: false, tried, err: "KV binding SRC is not configured" };
+  }
+
+  // 用户/环境指定前缀
+  const qpPrefix = (url.searchParams.get("kp") || url.searchParams.get("prefix") || "").trim();
+  const envPrefix = (env.KV_PREFIX || "").trim();
+
+  // 规范化：照顾是否带末尾斜杠
+  function normPrefix(p: string): string {
+    if (!p) return "";
+    return p.endsWith("/") ? p : p + "/";
+  }
+
+  const candidatesPrefixes = Array.from(new Set([
+    normPrefix(qpPrefix),
+    normPrefix(envPrefix),
+    "", "public/", "site/", "dist/", "app/", "www/", "out/", "build/",
+  ].filter((s) => typeof s === "string")));
+
+  // 多文件名尝试（仅默认首页时生效）
+  const fileNames = Array.from(new Set([
+    baseKey,
+    "public/index.php",
+    "index.php",
+  ]));
+
+  // 若 URL 明确给了 ?key= 则仅按该 key（再叠加可能的前缀）尝试
+  const keyOverride = (url.searchParams.get("key") || "").trim();
+  const finalNames = keyOverride ? [keyOverride] : fileNames;
+
+  // 组合前缀与文件名
+  const keysToTry: string[] = [];
+  for (const pf of candidatesPrefixes) {
+    for (const fn of finalNames) {
+      // pf 可能已包含相对目录；统一按“pf + fn（若 fn 本身以 / 开头，去掉）”
+      const cleanFn = fn.replace(/^\/+/, "");
+      const candidate = pf ? (pf + cleanFn) : cleanFn;
+      if (!keysToTry.includes(candidate)) keysToTry.push(candidate);
+    }
+  }
+
+  // 顺序尝试
+  for (const key of keysToTry) {
+    tried.push(key);
+    try {
+      const txt = await env.SRC.get(key, "text");
+      if (txt != null) {
+        return { ok: true, key, code: normalizePhpCodeForEval(txt), tried };
+      }
+    } catch (e: any) {
+      // 读取失败继续尝试
+    }
+  }
+
+  return { ok: false, tried, err: "KV object not found for any candidate keys" };
 }
 
 async function fetchGithubPhpSource(owner: string, repo: string, path: string, ref?: string): Promise<{ ok: boolean; code?: string; err?: string; status?: number }> {
@@ -316,30 +385,92 @@ async function routeRunPOST(request: Request, url: URL): Promise<Response> {
   }
 }
 
+// 列表诊断：列出 KV 键（prefix + limit + cursor）
+async function routeKvList(url: URL, env: any): Promise<Response> {
+  try {
+    if (!env?.SRC || typeof env.SRC.list !== "function") {
+      return textResponse("KV not configured", 500);
+    }
+    const prefix = url.searchParams.get("prefix") || "";
+    const limit = Math.max(1, Math.min(1000, Number(url.searchParams.get("limit") || "100")));
+    const cursor = url.searchParams.get("cursor") || undefined;
+    // @ts-ignore KVNamespace.list
+    const r = await env.SRC.list({ prefix, limit, cursor });
+    return new Response(JSON.stringify(r, null, 2), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+  } catch (e: any) {
+    return textResponse("kv list error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+// 读取诊断：支持 ?key=（单 key）或走“多前缀回退”，返回 tried 列表便于定位
+async function routeKvDiag(url: URL, env: any): Promise<Response> {
+  try {
+    const explicitKey = url.searchParams.get("key");
+    if (explicitKey) {
+      const r = await fetchKVPhpSource(env, explicitKey);
+      const payload = { explicitKey, ...r };
+      return new Response(JSON.stringify(payload, null, 2), { status: r.ok ? 200 : 404, headers: { "content-type": "application/json; charset=utf-8" } });
+    }
+    const r2 = await fetchKVPhpSourceWithPrefixes(env, url, "public/index.php");
+    return new Response(JSON.stringify(r2, null, 2), { status: r2.ok ? 200 : 404, headers: { "content-type": "application/json; charset=utf-8" } });
+  } catch (e: any) {
+    return textResponse("kv diag error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+function badKey(key: string) {
+  // 简单校验，避免非法 key
+  return key.length > 512 || key.includes("..") || key.startsWith("/") || key === "";
+}
+
+async function routeKvPut(request: Request, url: URL, env: any): Promise<Response> {
+  try {
+    if (!env?.SRC || typeof env.SRC.put !== "function") return textResponse("KV not configured", 500);
+    const admin = (env as any).ADMIN_TOKEN;
+    const token = request.headers.get("x-admin-token") || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!admin || token !== admin) return textResponse("Unauthorized", 401);
+
+    const key = url.searchParams.get("key") || "";
+    if (badKey(key)) return textResponse("Bad key", 400);
+
+    const body = await request.text();
+    if (!body) return textResponse("Empty body", 400);
+
+    await env.SRC.put(key, body, { expirationTtl: 0, metadata: { updatedAt: Date.now() } });
+    return textResponse("OK", 200);
+  } catch (e: any) {
+    return textResponse("kv put error: " + (e?.stack || String(e)), 500);
+  }
+}
+
 async function routeRepoIndex(url: URL, env: any): Promise<Response> {
   try {
     const ref = url.searchParams.get("ref") || undefined;
     const mode = url.searchParams.get("mode") || "";
-    const key = url.searchParams.get("key") || "public/index.php";
+    const baseKey = url.searchParams.get("key") || "public/index.php";
 
-    // 1) 优先从 R2 读
+    // 1) 优先从 KV 读（带多前缀/多文件名回退）
     let codeNormalized: string | undefined;
+    let hitKey: string | undefined;
     if (env && env.SRC) {
-      const r2 = await fetchR2PhpSource(env, key);
-      if (r2.ok) codeNormalized = r2.code!;
+      const kv = await fetchKVPhpSourceWithPrefixes(env, url, baseKey);
+      if (kv.ok) {
+        codeNormalized = kv.code!;
+        hitKey = kv.key!;
+      }
     }
 
-    // 2) R2 没拿到则回退 GitHub（保持原来的容灾）
+    // 2) KV 没拿到则回退 GitHub（容灾）
     if (!codeNormalized) {
-      const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", key, ref);
+      const pull = await fetchGithubPhpSource("szzdmj", "wasmphp", baseKey, ref);
       if (!pull.ok) return textResponse(pull.err || "Fetch error", 502);
       codeNormalized = pull.code || "";
       if (mode === "raw") {
-        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8", "x-source": "github" } });
       }
     } else {
       if (mode === "raw") {
-        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+        return new Response(codeNormalized, { status: 200, headers: { "content-type": "text/plain; charset=utf-8", "x-source": "kv", ...(hitKey ? { "x-kv-key": hitKey } : {}) } });
       }
     }
 
@@ -351,8 +482,10 @@ async function routeRepoIndex(url: URL, env: any): Promise<Response> {
     const res = await runAuto(argv, 10000);
     if (!res.ok) {
       const body = (res.stderr.join("\n") ? res.stderr.join("\n") + "\n" : "") + (res.error || "Unknown error") + "\ntrace: " + res.debug.join("->");
-      return textResponse(body, 500);
+      return textResponse(body, 500, hitKey ? { "x-kv-key": hitKey } : {});
     }
+    const headers: Record<string, string> = { "x-source": codeNormalized ? (hitKey ? "kv" : "github") : "unknown" };
+    if (hitKey) headers["x-kv-key"] = hitKey;
     return finalizeOk(url, res, "text/html; charset=utf-8");
   } catch (e: any) {
     return textResponse("routeRepoIndex error: " + (e?.stack || String(e)), 500);
@@ -385,16 +518,6 @@ async function routeHelp(): Promise<Response> {
   }
 }
 
-async function routeNet(url: URL, env: any): Promise<Response> {
-  try {
-    const key = url.searchParams.get("key") || "public/index.php";
-    const r2 = await fetchR2PhpSource(env, key);
-    return new Response(JSON.stringify(r2, null, 2), { status: r2.ok ? 200 : 502, headers: { "content-type": "application/json; charset=utf-8" } });
-  } catch (e: any) {
-    return textResponse("net error: " + (e?.stack || String(e)), 500);
-  }
-}
-
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
     try {
@@ -413,7 +536,7 @@ export default {
               hasWorkerCtor: typeof (globalThis as any).Worker !== "undefined",
               hasSharedArrayBuffer: typeof (globalThis as any).SharedArrayBuffer !== "undefined",
               userAgent: (globalThis as any).navigator?.userAgent ?? null,
-              hasR2: !!env?.SRC,
+              hasKV: !!env?.SRC,
             },
             importMeta: { available: typeof import.meta !== "undefined", url: importMetaUrl },
           };
@@ -435,31 +558,24 @@ export default {
         }
       }
 
-      if (pathname === "/__net") {
-        return routeNet(url, env);
+      if (pathname === "/__kv") {
+        return routeKvDiag(url, env);
+      }
+      if (pathname === "/__ls") {
+        return routeKvList(url, env);
+      }
+      if (pathname === "/__put" && (request.method === "POST" || request.method === "PUT")) {
+        return routeKvPut(request, url, env);
       }
 
-      // Home: render repo's /public/index.php from R2 (fallback GitHub)
-      if (pathname === "/" || pathname === "/index.php") {
+      // Home: render KV's /public/index.php (fallback GitHub)
+      if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
         return routeRepoIndex(url, env);
       }
 
-      // phpinfo on /info
-      if (pathname === "/info") {
-        return routeInfo(url);
-      }
-
-      if (pathname === "/public/index.php") {
-        return routeRepoIndex(url, env);
-      }
-
-      if (pathname === "/run" && request.method === "GET") {
-        return routeRunGET(url);
-      }
-      if (pathname === "/run" && request.method === "POST") {
-        return routeRunPOST(request, url);
-      }
-
+      if (pathname === "/info") return routeInfo(url);
+      if (pathname === "/run" && request.method === "GET") return routeRunGET(url);
+      if (pathname === "/run" && request.method === "POST") return routeRunPOST(request, url);
       if (pathname === "/version") return routeVersion();
       if (pathname === "/help") return routeHelp();
 
