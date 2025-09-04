@@ -3,6 +3,7 @@
 // - 工厂初始化更稳，去掉误导性的 "WORKER" 回退形态。
 // - 新增运行时内存调节：?mem=256(MB) 或 ?memBytes=268435456，?allowmg=1。
 //   遇到 “memory access out of bounds/oom/Cannot enlarge memory arrays” 自动放大 INITIAL_MEMORY 再试。
+// - 新增（本次合并）：/seed/clean 与 /seed/unpack，清理非 tar 键并把 tar(.tar/.tar.gz) 正确解包到 public/。
 
 import wasmAsset from "../scripts/php_8_4.wasm";
 
@@ -395,6 +396,254 @@ function toBase64Utf8(s: string): string {
   return btoa(binary);
 }
 
+// ===== 追加：KV 清理 + tar 解包到 public/ =====
+
+type AnyKV = {
+  get: (key: string, type?: "text" | "arrayBuffer" | "json" | "stream") => Promise<any>;
+  put: (key: string, value: any, opts?: any) => Promise<void>;
+  delete: (key: string) => Promise<void>;
+  list: (opts?: { prefix?: string; cursor?: string; limit?: number }) => Promise<{ keys: Array<{ name: string; metadata?: any }>; list_complete: boolean; cursor?: string }>;
+};
+
+function getKV(env: any): AnyKV {
+  const kv = (env as any).SRC || (env as any).FILES || (env as any).SRC_KV || (env as any).KV;
+  if (!kv || typeof kv.get !== "function") throw new Error("KV not configured (expected one of: SRC, FILES, SRC_KV, KV)");
+  return kv;
+}
+
+function requireAdmin(req: Request, env: any): Response | null {
+  const token = req.headers.get("x-admin-token") || req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!env?.ADMIN_TOKEN) return textResponse("ADMIN_TOKEN not set", 401);
+  if (token !== env.ADMIN_TOKEN) return textResponse("Unauthorized", 401);
+  return null;
+}
+
+function collapseSlashes(s: string) { return s.replace(/\/{2,}/g, "/"); }
+function normalizePosixPath(p: string): string | null {
+  let path = String(p || "").trim().replace(/^(\.\/)+/, "").replace(/^\/+/, "");
+  path = collapseSlashes(path);
+  const parts = path.split("/");
+  const out: string[] = [];
+  for (const seg of parts) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") { if (out.length === 0) return null; out.pop(); continue; }
+    out.push(seg);
+  }
+  return out.join("/");
+}
+// 归档 entry => 最终 KV 键：强制 targetPrefix（默认 public/），折叠 public/public/
+function normalizeTarEntryKey(path: string, targetPrefix = "public/"): string | null {
+  const norm = normalizePosixPath(path);
+  if (!norm) return null;
+  let key = norm;
+  const pref = targetPrefix.endsWith("/") ? targetPrefix : targetPrefix + "/";
+  if (!key.startsWith(pref)) key = pref + key;
+  key = key.replace(/^public\/public\//, "public/");
+  if (!key || key.endsWith("/") || key.includes("..")) return null;
+  return key;
+}
+
+function isGzip(u8: Uint8Array) { return u8.length >= 2 && u8[0] === 0x1f && u8[1] === 0x8b; }
+async function gunzipIfNeeded(ab: ArrayBuffer): Promise<Uint8Array> {
+  const u8 = new Uint8Array(ab);
+  if (!isGzip(u8)) return u8;
+  const ds = new DecompressionStream("gzip");
+  const decompressed = new Response(new Response(ab).body!.pipeThrough(ds));
+  const buf = await decompressed.arrayBuffer();
+  return new Uint8Array(buf);
+}
+
+function readCString(bytes: Uint8Array): string {
+  let end = bytes.length;
+  for (let i = 0; i < bytes.length; i++) { if (bytes[i] === 0) { end = i; break; } }
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+function parseOctal(bytes: Uint8Array): number {
+  const str = new TextDecoder().decode(bytes).replace(/\0.*$/, "").trim();
+  if (!str) return 0;
+  const s = str.replace(/[^0-7]/g, "");
+  return s ? parseInt(s, 8) : 0;
+}
+function hexOf(buf: ArrayBuffer | Uint8Array): string {
+  const u = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let s = ""; for (let i = 0; i < u.length; i++) s += u[i].toString(16).padStart(2, "0"); return s;
+}
+async function sha1Of(buf: ArrayBuffer | Uint8Array): Promise<string> {
+  const ab = buf instanceof Uint8Array ? buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) : buf;
+  const h = await crypto.subtle.digest("SHA-1", ab);
+  return hexOf(h);
+}
+function pLimit(concurrency: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  return function <T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        active++;
+        fn().then(resolve).catch(reject).finally(() => {
+          active--;
+          const next = queue.shift();
+          if (next) next();
+        });
+      };
+      if (active < concurrency) run(); else queue.push(run);
+    });
+  };
+}
+
+async function kvListAll(kv: AnyKV, opts: { prefix?: string; keep?: (name: string) => boolean }): Promise<{ total: number; deleted: number; kept: number }> {
+  let cursor: string | undefined = undefined;
+  let total = 0, deleted = 0, kept = 0;
+
+  do {
+    // @ts-ignore list typing
+    const page = await kv.list({ cursor, limit: 1000, prefix: opts.prefix });
+    cursor = page.list_complete ? undefined : page.cursor;
+    for (const k of page.keys as Array<{ name: string }>) {
+      total++;
+      if (opts.keep && opts.keep(k.name)) { kept++; continue; }
+      await kv.delete(k.name);
+      deleted++;
+    }
+  } while (cursor);
+
+  return { total, deleted, kept };
+}
+
+async function parseTarEntries(tarBytes: Uint8Array, targetPrefix = "public/"): Promise<Array<{ key: string; data: Uint8Array }>> {
+  const out: Array<{ key: string; data: Uint8Array }> = [];
+  let off = 0;
+  let pendingLongName: string | null = null;
+
+  while (off + 512 <= tarBytes.length) {
+    const header = tarBytes.subarray(off, off + 512);
+    off += 512;
+    const isZero = header.every((b) => b === 0);
+    if (isZero) break;
+
+    const name = readCString(header.subarray(0, 100));
+    const size = parseOctal(header.subarray(124, 136));
+    const typeflag = header[156];
+
+    let filename = pendingLongName || name;
+    pendingLongName = null;
+
+    if (typeflag === 76 /* 'L' GNU LongName */) {
+      const longBytes = tarBytes.subarray(off, off + Math.ceil(size / 512) * 512).subarray(0, size);
+      pendingLongName = new TextDecoder().decode(longBytes).replace(/\0+$/, "");
+      off += Math.ceil(size / 512) * 512;
+      continue;
+    }
+
+    const fileData = tarBytes.subarray(off, off + Math.ceil(size / 512) * 512).subarray(0, size);
+    off += Math.ceil(size / 512) * 512;
+
+    // 目录条目跳过
+    if (typeflag === 53 /* '5' */) continue;
+
+    const key = normalizeTarEntryKey(filename, targetPrefix);
+    if (!key) continue;
+
+    out.push({ key, data: fileData });
+  }
+
+  return out;
+}
+
+async function unpackTarToKV(kv: AnyKV, tarBuf: ArrayBuffer, opts?: { targetPrefix?: string; concurrency?: number; dry?: boolean }) {
+  const u8 = await gunzipIfNeeded(tarBuf); // 支持 .tar 与 .tar.gz
+  const entries = await parseTarEntries(u8, opts?.targetPrefix || "public/");
+  const limit = pLimit(Math.max(1, Math.min(32, opts?.concurrency || 8)));
+
+  let files = 0, bytes = 0, skipped = 0, errors = 0;
+  const tasks = entries.map((e) => limit(async () => {
+    try {
+      if (opts?.dry) { files++; bytes += e.data.byteLength; return; }
+      const etag = await sha1Of(e.data);
+      await kv.put(e.key, e.data as any, { metadata: { updatedAt: Date.now(), src: "seed-tar", etag } });
+      files++; bytes += e.data.byteLength;
+    } catch {
+      errors++; skipped++;
+    }
+  }));
+
+  await Promise.allSettled(tasks);
+  return { files, bytes, skipped, errors, totalEntries: entries.length };
+}
+
+async function routeSeedClean(request: Request, url: URL, env: any): Promise<Response> {
+  const guard = requireAdmin(request, env);
+  if (guard) return guard;
+
+  try {
+    const kv = getKV(env);
+    const tarKey = url.searchParams.get("tarKey") || "public/./public.tar";
+    const keepMeta = url.searchParams.get("keepMeta") === "1" || url.searchParams.get("keepMeta") === "true";
+    const dry = url.searchParams.get("dry") === "1" || url.searchParams.get("dry") === "true";
+
+    const keepFn = (name: string) => {
+      if (name === tarKey) return true;
+      if (keepMeta && name.startsWith("meta/")) return true;
+      return false;
+    };
+
+    if (dry) {
+      // 仅统计
+      let cursor: string | undefined = undefined;
+      let total = 0, toDelete = 0, kept = 0;
+      do {
+        // @ts-ignore KV.list
+        const page = await kv.list({ cursor, limit: 1000 });
+        cursor = page.list_complete ? undefined : page.cursor;
+        for (const k of page.keys as Array<{ name: string }>) {
+          total++;
+          if (keepFn(k.name)) kept++; else toDelete++;
+        }
+      } while (cursor);
+      return new Response(JSON.stringify({ ok: true, mode: "dry", total, toDelete, kept, tarKey, keepMeta }, null, 2), {
+        status: 200, headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+
+    const res = await kvListAll(kv, { keep: keepFn });
+    return new Response(JSON.stringify({ ok: true, ...res, tarKey, keepMeta }, null, 2), {
+      status: 200, headers: { "content-type": "application/json; charset=utf-8" },
+    });
+  } catch (e: any) {
+    return textResponse("clean error: " + (e?.stack || String(e)), 500);
+  }
+}
+
+async function routeSeedUnpack(request: Request, url: URL, env: any): Promise<Response> {
+  const guard = requireAdmin(request, env);
+  if (guard) return guard;
+
+  try {
+    const kv = getKV(env);
+    const tarKey = url.searchParams.get("key") || "public/./public.tar";
+    const dry = url.searchParams.get("dry") === "1" || url.searchParams.get("dry") === "true";
+    const targetPrefix = url.searchParams.get("prefix") || "public/";
+    const concurrency = Number(url.searchParams.get("concurrency") || "8");
+
+    const arr = await kv.get(tarKey, "arrayBuffer");
+    if (!arr) return textResponse("tar not found: " + tarKey, 404);
+
+    const result = await unpackTarToKV(kv, arr as ArrayBuffer, { targetPrefix, concurrency, dry });
+
+    // HEAD 请求仅做预览
+    if (request.method === "HEAD") {
+      return new Response(JSON.stringify({ ok: true, tarKey, dry: true, targetPrefix, concurrency, ...result }, null, 2), {
+        status: 200, headers: { "content-type": "application/json; charset=utf-8" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true, tarKey, dry, targetPrefix, concurrency, ...result }, null, 2), {
+      status: 200, headers: { "content-type": "application/json; charset=utf-8" },
+    });
+  } catch (e: any) {
+    return textResponse("unpack error: " + (e?.stack || String(e)), 500);
+  }
+}
+
 // ——— Routes ———
 async function routeInfo(url: URL, env?: any): Promise<Response> {
   try {
@@ -631,6 +880,14 @@ export default {
       }
       if (pathname === "/__put" && (request.method === "POST" || request.method === "PUT")) {
         return routeKvPut(request, url, env);
+      }
+
+      // 新增：KV 清理与解包
+      if (pathname === "/seed/clean" && request.method === "POST") {
+        return routeSeedClean(request, url, env);
+      }
+      if (pathname === "/seed/unpack" && (request.method === "POST" || request.method === "HEAD")) {
+        return routeSeedUnpack(request, url, env);
       }
 
       if (pathname === "/" || pathname === "/index.php" || pathname === "/public/index.php") {
